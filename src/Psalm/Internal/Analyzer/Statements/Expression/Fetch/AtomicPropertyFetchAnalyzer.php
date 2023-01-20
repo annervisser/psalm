@@ -6,6 +6,7 @@ use InvalidArgumentException;
 use PhpParser;
 use PhpParser\Node\Expr\PropertyFetch;
 use PhpParser\Node\Expr\StaticPropertyFetch;
+use PhpParser\Node\Stmt\EnumCase;
 use Psalm\CodeLocation;
 use Psalm\Codebase;
 use Psalm\Config;
@@ -45,6 +46,7 @@ use Psalm\Node\VirtualArg;
 use Psalm\Node\VirtualIdentifier;
 use Psalm\Plugin\EventHandler\Event\AddRemoveTaintsEvent;
 use Psalm\Storage\ClassLikeStorage;
+use Psalm\Storage\EnumCaseStorage;
 use Psalm\Type;
 use Psalm\Type\Atomic;
 use Psalm\Type\Atomic\TEnumCase;
@@ -55,6 +57,7 @@ use Psalm\Type\Atomic\TLiteralInt;
 use Psalm\Type\Atomic\TLiteralString;
 use Psalm\Type\Atomic\TMixed;
 use Psalm\Type\Atomic\TNamedObject;
+use Psalm\Type\Atomic\TNever;
 use Psalm\Type\Atomic\TNull;
 use Psalm\Type\Atomic\TObject;
 use Psalm\Type\Atomic\TObjectWithProperties;
@@ -62,13 +65,17 @@ use Psalm\Type\Atomic\TString;
 use Psalm\Type\Atomic\TTemplateParam;
 use Psalm\Type\Union;
 
+use function array_filter;
 use function array_keys;
+use function array_map;
 use function array_search;
 use function count;
 use function in_array;
 use function is_int;
 use function is_string;
 use function strtolower;
+use const ARRAY_FILTER_USE_BOTH;
+use const ARRAY_FILTER_USE_KEY;
 
 /**
  * @internal
@@ -198,7 +205,7 @@ class AtomicPropertyFetchAnalyzer
                     ]),
                 );
             } elseif ($prop_name === 'value' && $class_storage->enum_type !== null && $class_storage->enum_cases) {
-                self::handleEnumValue($statements_analyzer, $stmt, $class_storage);
+                self::handleEnumValue($statements_analyzer, $stmt, $stmt_var_type, $class_storage);
             } elseif ($prop_name === 'name') {
                 self::handleEnumName($statements_analyzer, $stmt, $lhs_type_part);
             } else {
@@ -941,11 +948,31 @@ class AtomicPropertyFetchAnalyzer
     private static function handleEnumValue(
         StatementsAnalyzer $statements_analyzer,
         PropertyFetch $stmt,
+        Union $stmt_var_type,
         ClassLikeStorage $class_storage
     ): void {
+        $relevant_enum_cases = array_filter(
+            $stmt_var_type->getAtomicTypes(),
+            static fn(Atomic $type) => $type instanceof TEnumCase,
+        );
+        $relevant_enum_case_names = array_map(
+            static fn(TEnumCase $enumCase) => $enumCase->case_name,
+            $relevant_enum_cases,
+        );
+
+
+        $enum_cases = $class_storage->enum_cases;
+        if (!empty($relevant_enum_case_names)) {
+            $enum_cases = array_filter(
+                $enum_cases,
+                static fn(string $key) => in_array($key, $relevant_enum_case_names, true),
+                ARRAY_FILTER_USE_KEY,
+            );
+        }
+
         $case_values = [];
 
-        foreach ($class_storage->enum_cases as $enum_case) {
+        foreach ($enum_cases as $enum_case) {
             if (is_string($enum_case->value)) {
                 $case_values[] = new TLiteralString($enum_case->value);
             } elseif (is_int($enum_case->value)) {
@@ -956,11 +983,9 @@ class AtomicPropertyFetchAnalyzer
             }
         }
 
-        // todo: this is suboptimal when we reference enum directly, e.g. Status::Open->value
-        /** @psalm-suppress ArgumentTypeCoercion */
         $statements_analyzer->node_data->setType(
             $stmt,
-            new Union($case_values),
+            new Union(empty($case_values) ? [new TNever()] : $case_values),
         );
     }
 
